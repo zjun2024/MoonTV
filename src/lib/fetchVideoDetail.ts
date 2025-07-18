@@ -1,22 +1,12 @@
-export interface VideoDetail {
-  id: string;
-  title: string;
-  poster: string;
-  episodes: string[];
-  source: string;
-  source_name: string;
-  class?: string;
-  year: string;
-  desc?: string;
-  type_name?: string;
-  douban_id?: number;
-}
+import { getAvailableApiSites } from '@/lib/config';
+import { SearchResult } from '@/lib/types';
+
+import { getDetailFromApi, searchFromApi } from './downstream';
 
 interface FetchVideoDetailOptions {
   source: string;
   id: string;
   fallbackTitle?: string;
-  fallbackYear?: string;
 }
 
 /**
@@ -28,24 +18,23 @@ export async function fetchVideoDetail({
   source,
   id,
   fallbackTitle = '',
-  fallbackYear = '',
-}: FetchVideoDetailOptions): Promise<VideoDetail> {
+}: FetchVideoDetailOptions): Promise<SearchResult> {
   // 优先通过搜索接口查找精确匹配
+  const apiSites = await getAvailableApiSites();
+  const apiSite = apiSites.find((site) => site.key === source);
+  if (!apiSite) {
+    throw new Error('无效的API来源');
+  }
   if (fallbackTitle) {
     try {
-      const searchResp = await fetch(
-        `/api/search?q=${encodeURIComponent(fallbackTitle.trim())}`
+      const searchData = await searchFromApi(apiSite, fallbackTitle.trim());
+      const exactMatch = searchData.find(
+        (item: SearchResult) =>
+          item.source.toString() === source.toString() &&
+          item.id.toString() === id.toString()
       );
-      if (searchResp.ok) {
-        const searchData = await searchResp.json();
-        const exactMatch = searchData.results.find(
-          (item: VideoDetail) =>
-            item.source.toString() === source.toString() &&
-            item.id.toString() === id.toString()
-        );
-        if (exactMatch) {
-          return exactMatch as VideoDetail;
-        }
+      if (exactMatch) {
+        return exactMatch;
       }
     } catch (error) {
       // do nothing
@@ -53,22 +42,10 @@ export async function fetchVideoDetail({
   }
 
   // 调用 /api/detail 接口
-  const response = await fetch(`/api/detail?source=${source}&id=${id}`);
-  if (!response.ok) {
-    throw new Error('获取详情失败');
+  const detail = await getDetailFromApi(apiSite, id);
+  if (!detail) {
+    throw new Error('获取视频详情失败');
   }
-  const data = await response.json();
 
-  return {
-    id: data?.videoInfo?.id || id,
-    title: data?.videoInfo?.title.trim() || fallbackTitle.trim(),
-    poster: data?.videoInfo?.cover || '',
-    episodes: data?.episodes || [],
-    source: data?.videoInfo?.source || source,
-    source_name: data?.videoInfo?.source_name || '',
-    class: data?.videoInfo?.remarks || '',
-    year: data?.videoInfo?.year || fallbackYear || '',
-    desc: data?.videoInfo?.desc || '',
-    type_name: data?.videoInfo?.type || '',
-  } as VideoDetail;
+  return detail;
 }

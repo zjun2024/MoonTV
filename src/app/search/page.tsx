@@ -1,4 +1,4 @@
-/* eslint-disable react-hooks/exhaustive-deps */
+/* eslint-disable react-hooks/exhaustive-deps, @typescript-eslint/no-explicit-any */
 'use client';
 
 import { Search, X } from 'lucide-react';
@@ -10,10 +10,10 @@ import {
   clearSearchHistory,
   deleteSearchHistory,
   getSearchHistory,
+  subscribeToDataUpdates,
 } from '@/lib/db.client';
 import { SearchResult } from '@/lib/types';
 
-import AggregateCard from '@/components/AggregateCard';
 import PageLayout from '@/components/PageLayout';
 import VideoCard from '@/components/VideoCard';
 
@@ -28,33 +28,83 @@ function SearchPageClient() {
   const [showResults, setShowResults] = useState(false);
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
 
-  // 视图模式：聚合(agg) 或 全部(all)，默认值由环境变量 NEXT_PUBLIC_AGGREGATE_SEARCH_RESULT 决定
-  const [viewMode, setViewMode] = useState<'agg' | 'all'>(
-    process.env.NEXT_PUBLIC_AGGREGATE_SEARCH_RESULT === 'false' ||
-      process.env.NEXT_PUBLIC_AGGREGATE_SEARCH_RESULT === '0'
-      ? 'all'
-      : 'agg'
-  );
+  // 获取默认聚合设置：只读取用户本地设置，默认为 true
+  const getDefaultAggregate = () => {
+    if (typeof window !== 'undefined') {
+      const userSetting = localStorage.getItem('defaultAggregateSearch');
+      if (userSetting !== null) {
+        return JSON.parse(userSetting);
+      }
+    }
+    return true; // 默认启用聚合
+  };
+
+  const [viewMode, setViewMode] = useState<'agg' | 'all'>(() => {
+    return getDefaultAggregate() ? 'agg' : 'all';
+  });
 
   // 聚合后的结果（按标题和年份分组）
   const aggregatedResults = useMemo(() => {
     const map = new Map<string, SearchResult[]>();
     searchResults.forEach((item) => {
-      // 使用 title + year + type 作为键，若 year 不存在则使用 'unknown'
-      const key = `${item.title}-${item.year || 'unknown'}-${
-        item.episodes.length === 1 ? 'movie' : 'tv'
-      }`;
+      // 使用 title + year + type 作为键，year 必然存在，但依然兜底 'unknown'
+      const key = `${item.title.replaceAll(' ', '')}-${
+        item.year || 'unknown'
+      }-${item.episodes.length === 1 ? 'movie' : 'tv'}`;
       const arr = map.get(key) || [];
       arr.push(item);
       map.set(key, arr);
     });
-    return map;
+    return Array.from(map.entries()).sort((a, b) => {
+      // 优先排序：标题与搜索词完全一致的排在前面
+      const aExactMatch = a[1][0].title
+        .replaceAll(' ', '')
+        .includes(searchQuery.trim().replaceAll(' ', ''));
+      const bExactMatch = b[1][0].title
+        .replaceAll(' ', '')
+        .includes(searchQuery.trim().replaceAll(' ', ''));
+
+      if (aExactMatch && !bExactMatch) return -1;
+      if (!aExactMatch && bExactMatch) return 1;
+
+      // 年份排序
+      if (a[1][0].year === b[1][0].year) {
+        return a[0].localeCompare(b[0]);
+      } else {
+        // 处理 unknown 的情况
+        const aYear = a[1][0].year;
+        const bYear = b[1][0].year;
+
+        if (aYear === 'unknown' && bYear === 'unknown') {
+          return 0;
+        } else if (aYear === 'unknown') {
+          return 1; // a 排在后面
+        } else if (bYear === 'unknown') {
+          return -1; // b 排在后面
+        } else {
+          // 都是数字年份，按数字大小排序（大的在前面）
+          return aYear > bYear ? -1 : 1;
+        }
+      }
+    });
   }, [searchResults]);
 
   useEffect(() => {
     // 无搜索参数时聚焦搜索框
     !searchParams.get('q') && document.getElementById('searchInput')?.focus();
+
+    // 初始加载搜索历史
     getSearchHistory().then(setSearchHistory);
+
+    // 监听搜索历史更新事件
+    const unsubscribe = subscribeToDataUpdates(
+      'searchHistoryUpdated',
+      (newHistory: string[]) => {
+        setSearchHistory(newHistory);
+      }
+    );
+
+    return unsubscribe;
   }, []);
 
   useEffect(() => {
@@ -64,11 +114,8 @@ function SearchPageClient() {
       setSearchQuery(query);
       fetchSearchResults(query);
 
-      // 保存到搜索历史
-      addSearchHistory(query).then(async () => {
-        const history = await getSearchHistory();
-        setSearchHistory(history);
-      });
+      // 保存到搜索历史 (事件监听会自动更新界面)
+      addSearchHistory(query);
     } else {
       setShowResults(false);
     }
@@ -81,7 +128,33 @@ function SearchPageClient() {
         `/api/search?q=${encodeURIComponent(query.trim())}`
       );
       const data = await response.json();
-      setSearchResults(data.results);
+      setSearchResults(
+        data.results.sort((a: SearchResult, b: SearchResult) => {
+          // 优先排序：标题与搜索词完全一致的排在前面
+          const aExactMatch = a.title === query.trim();
+          const bExactMatch = b.title === query.trim();
+
+          if (aExactMatch && !bExactMatch) return -1;
+          if (!aExactMatch && bExactMatch) return 1;
+
+          // 如果都匹配或都不匹配，则按原来的逻辑排序
+          if (a.year === b.year) {
+            return a.title.localeCompare(b.title);
+          } else {
+            // 处理 unknown 的情况
+            if (a.year === 'unknown' && b.year === 'unknown') {
+              return 0;
+            } else if (a.year === 'unknown') {
+              return 1; // a 排在后面
+            } else if (b.year === 'unknown') {
+              return -1; // b 排在后面
+            } else {
+              // 都是数字年份，按数字大小排序（大的在前面）
+              return parseInt(a.year) > parseInt(b.year) ? -1 : 1;
+            }
+          }
+        })
+      );
       setShowResults(true);
     } catch (error) {
       setSearchResults([]);
@@ -104,11 +177,8 @@ function SearchPageClient() {
     // 直接发请求
     fetchSearchResults(trimmed);
 
-    // 保存到搜索历史
-    addSearchHistory(trimmed).then(async () => {
-      const history = await getSearchHistory();
-      setSearchHistory(history);
-    });
+    // 保存到搜索历史 (事件监听会自动更新界面)
+    addSearchHistory(trimmed);
   };
 
   return (
@@ -168,19 +238,21 @@ function SearchPageClient() {
                 className='justify-start grid grid-cols-3 gap-x-2 gap-y-14 sm:gap-y-20 px-0 sm:px-2 sm:grid-cols-[repeat(auto-fill,_minmax(11rem,_1fr))] sm:gap-x-8'
               >
                 {viewMode === 'agg'
-                  ? Array.from(aggregatedResults.entries()).map(
-                      ([mapKey, group]) => {
-                        return (
-                          <div key={`agg-${mapKey}`} className='w-full'>
-                            <AggregateCard
-                              items={group}
-                              query={searchQuery}
-                              year={group[0].year}
-                            />
-                          </div>
-                        );
-                      }
-                    )
+                  ? aggregatedResults.map(([mapKey, group]) => {
+                      return (
+                        <div key={`agg-${mapKey}`} className='w-full'>
+                          <VideoCard
+                            from='search'
+                            items={group}
+                            query={
+                              searchQuery.trim() !== group[0].title
+                                ? searchQuery.trim()
+                                : ''
+                            }
+                          />
+                        </div>
+                      );
+                    })
                   : searchResults.map((item) => (
                       <div
                         key={`all-${item.source}-${item.id}`}
@@ -193,7 +265,12 @@ function SearchPageClient() {
                           episodes={item.episodes.length}
                           source={item.source}
                           source_name={item.source_name}
-                          douban_id={item.douban_id}
+                          douban_id={item.douban_id?.toString()}
+                          query={
+                            searchQuery.trim() !== item.title
+                              ? searchQuery.trim()
+                              : ''
+                          }
                           from='search'
                         />
                       </div>
@@ -212,9 +289,8 @@ function SearchPageClient() {
                 搜索历史
                 {searchHistory.length > 0 && (
                   <button
-                    onClick={async () => {
-                      await clearSearchHistory();
-                      setSearchHistory([]);
+                    onClick={() => {
+                      clearSearchHistory(); // 事件监听会自动更新界面
                     }}
                     className='ml-3 text-sm text-gray-500 hover:text-red-500 transition-colors dark:text-gray-400 dark:hover:text-red-500'
                   >
@@ -239,12 +315,10 @@ function SearchPageClient() {
                     {/* 删除按钮 */}
                     <button
                       aria-label='删除搜索历史'
-                      onClick={async (e) => {
+                      onClick={(e) => {
                         e.stopPropagation();
                         e.preventDefault();
-                        await deleteSearchHistory(item);
-                        const history = await getSearchHistory();
-                        setSearchHistory(history);
+                        deleteSearchHistory(item); // 事件监听会自动更新界面
                       }}
                       className='absolute -top-1 -right-1 w-4 h-4 opacity-0 group-hover:opacity-100 bg-gray-400 hover:bg-red-500 text-white rounded-full flex items-center justify-center text-[10px] transition-colors'
                     >
